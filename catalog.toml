@@ -1,0 +1,11 @@
+[[plugin]]
+id          = "local/agent-status"
+name        = "Desktop Agent Status"
+version     = "1.0.2"
+author      = "local"
+license     = "MIT"
+icon        = "sparkles"
+description = "Antigravity activity from lifecycle hooks; click to toggle the agent scratchpad."
+deprecated  = false
+plugin_api  = 45
+tags        = ["ai", "bar", "development"]
