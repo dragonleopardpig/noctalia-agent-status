@@ -57,13 +57,58 @@ class AgentStatusTests(unittest.TestCase):
         self.assertEqual(current["counts"]["working"], 1)
         self.assertEqual(current["counts"]["waiting"], 1)
 
+    def test_quota_failure_reports_reset_without_saving_error_text(self):
+        now = time.time()
+        with patch.object(agent.time, "time", return_value=now):
+            failure = self.emit(
+                "Stop", terminationReason="error",
+                error="RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h7m36s. PRIVATE",
+            )["failure"]
+        path = agent.record_path("first")
+        saved = path.read_text()
+        self.assertNotIn("PRIVATE", saved)
+        retry_at = now + 4056
+        self.assertEqual(json.loads(saved)["failure"], {"kind": "quota", "retry_at": retry_at})
+        self.assertEqual(failure, {
+            "kind": "quota", "reported_at": agent.display_time(now),
+            "retry_time": agent.display_time(retry_at), "retry_passed": False,
+        })
+        with patch.object(agent.time, "time", return_value=retry_at):
+            self.assertTrue(agent.snapshot()["failure"]["retry_passed"])
+        self.assertNotIn("failure", self.emit("PreInvocation"))
+
+    def test_failure_types_and_legacy_record(self):
+        for reason, error, kind in (
+            ("error", "HTTP 429 Too many requests", "rate_limit"),
+            ("error", "UNAUTHENTICATED (code 401)", "sign_in"),
+            ("error", "permission_denied", "access_denied"),
+            ("error", "503 Service Unavailable", "unavailable"),
+            ("error", "deadline exceeded", "timeout"),
+            ("max_steps_exceeded", "", "step_limit"),
+            ("max_tokens_exceeded", "", "token_limit"),
+            ("error", "unexpected result", "request_failed"),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.emit("Stop", terminationReason=reason, error=error)["failure"]["kind"],
+                                 kind)
+
+        path = agent.record_path("first")
+        record = json.loads(path.read_text())
+        record.pop("failure")
+        path.write_text(json.dumps(record))
+        self.assertEqual(agent.snapshot()["failure"], {
+            "kind": "request_failed", "reported_at": agent.display_time(record["updated"]),
+        })
+
     def test_pid_reuse_is_treated_as_interrupted(self):
         self.emit("PreInvocation")
         path = agent.record_path("first")
         record = json.loads(path.read_text())
         record["start_time"] = "different process"
         path.write_text(json.dumps(record))
-        self.assertEqual(agent.snapshot()["status"], "error")
+        interrupted = agent.snapshot()
+        self.assertEqual(interrupted["status"], "error")
+        self.assertEqual(interrupted["failure"]["kind"], "interrupted")
         record["updated"] -= agent.RETENTION_SECONDS + 1
         path.write_text(json.dumps(record))
         self.assertEqual(agent.snapshot()["status"], "idle")

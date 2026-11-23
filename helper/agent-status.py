@@ -10,12 +10,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
 
 EVENTS = ("SessionStart", "PreInvocation", "PreToolUse", "PostToolUse", "Stop")
 RETENTION_SECONDS = 600
+FAILURE_KINDS = {
+    "quota", "rate_limit", "sign_in", "access_denied", "unavailable",
+    "timeout", "step_limit", "token_limit", "interrupted", "launch", "request_failed",
+}
+RETRY_DURATION = re.compile(r"\b(?:resets? in|retry after)\s+((?:\d{1,4}[dhms]\s*)+)\b")
+DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
 def status_root():
@@ -60,7 +67,60 @@ def record_path(identifier):
     return status_root() / f"{name}.json"
 
 
-def save_record(identifier, status, payload):
+def failure_details(reason, error, updated):
+    """Extract a display category and optional retry time from a Stop event."""
+    text = error.casefold() if isinstance(error, str) else ""
+    if "quota" in text:
+        kind = "quota"
+    elif re.search(r"\b(?:429|resource_exhausted|rate limit|too many requests)\b", text):
+        kind = "rate_limit"
+    elif re.search(r"\b(?:401|unauthenticated|unauthorized)\b", text):
+        kind = "sign_in"
+    elif re.search(r"\b(?:403|permission_denied|permission denied)\b", text):
+        kind = "access_denied"
+    elif re.search(r"\b(?:503|service unavailable|overloaded)\b", text):
+        kind = "unavailable"
+    elif re.search(r"\b(?:timeout|timed out|deadline_exceeded|deadline exceeded)\b", text):
+        kind = "timeout"
+    elif reason == "max_steps_exceeded":
+        kind = "step_limit"
+    elif reason == "max_tokens_exceeded":
+        kind = "token_limit"
+    else:
+        kind = "request_failed"
+
+    detail = {"kind": kind}
+    if kind in {"quota", "rate_limit"} and (match := RETRY_DURATION.search(text)):
+        seconds = sum(int(value) * DURATION_UNITS[unit]
+                      for value, unit in re.findall(r"(\d+)([dhms])", match[1]))
+        if seconds:
+            detail["retry_at"] = updated + seconds
+    return detail
+
+
+def display_time(timestamp):
+    try:
+        return time.strftime("%b %d %H:%M:%S %Z", time.localtime(timestamp))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def snapshot_failure(record, now):
+    """Describe the selected failure using only known kinds and local times."""
+    stored = record.get("failure")
+    if not isinstance(stored, dict):
+        stored = {}
+    kind = stored.get("kind")
+    detail = {"kind": kind if isinstance(kind, str) and kind in FAILURE_KINDS else "request_failed",
+              "reported_at": display_time(float(record["updated"]))}
+    retry_at = stored.get("retry_at")
+    if detail["kind"] in {"quota", "rate_limit"} and type(retry_at) in (int, float):
+        if retry_time := display_time(retry_at):
+            detail.update(retry_time=retry_time, retry_passed=now >= retry_at)
+    return detail
+
+
+def save_record(identifier, status, payload, *, failure=None):
     directory = status_root()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     pid = agent_pid()
@@ -69,6 +129,9 @@ def save_record(identifier, status, payload):
     workspace = Path(paths[0]).name[:120] if paths and isinstance(paths[0], str) else ""
     data = {"status": status, "updated": time.time(), "pid": pid,
             "start_time": identity[1] if identity else None, "workspace": workspace}
+    if status == "error":
+        data["failure"] = failure or failure_details(
+            payload.get("terminationReason"), payload.get("error"), data["updated"])
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
@@ -121,6 +184,7 @@ def snapshot():
                     continue
                 if state == "working":
                     record["status"] = "error"
+                    record["failure"] = {"kind": "interrupted"}
             records.append(record)
         except (OSError, ValueError, TypeError, KeyError):
             continue
@@ -135,7 +199,10 @@ def snapshot():
         state = selected["status"]
     else:
         selected, state = {}, "idle"
-    return {"status": state, "counts": counts, "workspace": selected.get("workspace", "")}
+    result = {"status": state, "counts": counts, "workspace": selected.get("workspace", "")}
+    if state == "error":
+        result["failure"] = snapshot_failure(selected, now)
+    return result
 
 
 def main():
@@ -165,7 +232,7 @@ def main():
         try:
             os.execv(executable, [executable, "--dangerously-skip-permissions", *args.arguments])
         except OSError as error:
-            save_record(identifier, "error", {})
+            save_record(identifier, "error", {}, failure={"kind": "launch"})
             print(f"Unable to launch Antigravity: {error}", file=sys.stderr)
             return 127
     elif args.command == "status":

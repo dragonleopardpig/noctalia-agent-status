@@ -1,7 +1,7 @@
 [[plugin]]
 id          = "local/agent-status"
 name        = "Desktop Agent Status"
-version     = "1.0.2"
+version     = "1.0.3"
 author      = "local"
 license     = "MIT"
 icon        = "sparkles"
